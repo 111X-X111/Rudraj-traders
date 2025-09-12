@@ -274,7 +274,7 @@ def update_live_oi_from_quote(kite: KiteConnect, details: dict):
         st.session_state["offline"] = False
     except Exception as e:
         # network / auth / rate limit failure => offline mode
-        st.session_state["offline"] = True
+        st.session_state["online"] = True
         return
 
     any_success = False
@@ -315,7 +315,7 @@ def fetch_last_oi_at_close(kite: KiteConnect, details: dict):
         _ = kite.profile()
         st.session_state["offline"] = False
     except Exception:
-        st.session_state["offline"] = True
+        st.session_state["online"] = True
         return
 
     for key, d in details.items():
@@ -537,16 +537,20 @@ with st.sidebar:
     strike_diff = 50 if underlying == "NIFTY 50" else 100
     levels = st.slider("Strikes each side of ATM", 1, 6, 2)
     refresh = st.number_input("Refresh seconds", min_value=5, max_value=300, value=30, step=5)
-    autorun = st.checkbox("Auto-refresh", value=False)
+    autorun = st.checkbox("Auto-refresh", value=True)
     go = st.button("Run / Refresh")
 
 market_closed = is_market_closed_now()
 
 # Auto-refresh
+# Auto-refresh (soft)
 if autorun and not market_closed:
-    if HAVE_ST_AUTOREFRESH:
-        st_autorefresh(interval=refresh * 1000, key="autorefresh_counter")
-    else:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=refresh * 1000, key="oi_soft_refresh")
+        st.caption(f"🔄 Soft auto-refresh ON — every {refresh} seconds")
+    except ImportError:
+        # fallback if streamlit-autorefresh not installed
         last = st.session_state.get("last_refresh", 0.0)
         now = time.time()
         if now - last > refresh:
@@ -555,6 +559,7 @@ if autorun and not market_closed:
                 st.experimental_rerun()
             except Exception:
                 pass
+
 
 # ensure session history loaded
 _ensure_session_struct()
