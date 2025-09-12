@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-# main.py — Streamlit OI tracker with local persistence of minute OI history
+# main_soft_refresh_alerts.py — Streamlit OI tracker with soft auto-refresh, countdown timer, and visual alerts
 #
 # Install:
-#   pip install streamlit kiteconnect pandas pytz
+#   pip install streamlit streamlit-autorefresh kiteconnect pandas pytz
 #
 # Run:
-#   streamlit run main.py
+#   streamlit run main_soft_refresh_alerts.py
 
 import os
 import json
 import time
+import threading
 from datetime import datetime, date, timedelta, timezone, time as dtime
 
 import pandas as pd
 import pytz
 import streamlit as st
 from kiteconnect import KiteConnect
+import math
 
-# Prefer st_autorefresh when available
+# Try to import streamlit-autorefresh (soft rerun). If not available, we'll fallback.
 try:
-    from streamlit import st_autorefresh  # type: ignore
-    HAVE_ST_AUTOREFRESH = True
+    from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
+    HAVE_STREAMLIT_AUTOREFRESH = True
 except Exception:
-    HAVE_ST_AUTOREFRESH = False
+    HAVE_STREAMLIT_AUTOREFRESH = False
 
 # ---------- Config ----------
 HISTORY_FILE = "oi_history.json"
@@ -32,9 +34,10 @@ OI_CHANGE_INTERVALS_MIN = (5, 10, 15, 30)
 PCT_CHANGE_THRESHOLDS = {5: 8.0, 10: 10.0, 15: 15.0, 30: 25.0}
 IST = pytz.timezone("Asia/Kolkata")
 
-EXCHANGE_NFO = KiteConnect.EXCHANGE_NFO
-EXCHANGE_LTP = KiteConnect.EXCHANGE_NSE
+EXCHANGE_NFO = "NFO"
+EXCHANGE_LTP = "NSE"
 
+# NOTE: keys copied from your original file; keep secure.
 API_KEY = "afzia78cwraaod5x"
 API_SECRET = "b527807j5ilcndjp5u2jhu9znrjxz35e"
 
@@ -42,7 +45,6 @@ API_SECRET = "b527807j5ilcndjp5u2jhu9znrjxz35e"
 def _dt_to_iso(dt):
     if dt is None:
         return None
-    # ensure aware in UTC
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat()
@@ -56,11 +58,6 @@ def _iso_to_dt(s):
         return None
 
 def load_persisted_history(path=HISTORY_FILE):
-    """
-    Load persisted history from JSON. Format:
-      { key: [ [iso_ts, oi_or_null], ... ], ... }
-    Returns dict: key -> list of (utc_dt, oi)
-    """
     if not os.path.exists(path):
         return {}
     try:
@@ -82,7 +79,6 @@ def load_persisted_history(path=HISTORY_FILE):
                 except Exception:
                     pass
             lst.append((ts, oi))
-        # keep only last HISTORICAL_MAX_MINUTES window
         if lst:
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=HISTORICAL_MAX_MINUTES)
             lst = [t for t in lst if t[0] is not None and t[0] >= cutoff]
@@ -90,13 +86,9 @@ def load_persisted_history(path=HISTORY_FILE):
     return out
 
 def save_persisted_history(history: dict, path=HISTORY_FILE):
-    """
-    Save history dict (key -> list of (utc_dt, oi)) to JSON atomically.
-    """
     tmp = path + ".tmp"
     raw = {}
     for key, lst in history.items():
-        # if timestamps are None, skip them
         arr = []
         for t, oi in lst:
             arr.append([_dt_to_iso(t), oi])
@@ -106,7 +98,6 @@ def save_persisted_history(history: dict, path=HISTORY_FILE):
             json.dump(raw, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
-        # best-effort, ignore persistence errors
         pass
 
 # ---------- Helpers ----------
@@ -137,8 +128,7 @@ def get_atm_strike(kite_obj: KiteConnect, underlying_sym: str, exch_for_ltp: str
         ltp = ltp_data[ltp_inst]["last_price"]
         atm = round(ltp / strike_diff) * strike_diff
         return atm, ltp
-    except Exception as e:
-        # error fetching LTP
+    except Exception:
         return None, None
 
 def list_expiries(instruments: list, underlying_prefix: str):
@@ -218,7 +208,6 @@ def market_close_datetime_utc(ref_date: date):
 # ---------- History & live handling with persistence ----------
 def _ensure_session_struct():
     if "oi_history" not in st.session_state:
-        # start by loading persisted history (best-effort)
         st.session_state["oi_history"] = load_persisted_history()
     if "last_refresh" not in st.session_state:
         st.session_state["last_refresh"] = 0.0
@@ -230,11 +219,12 @@ def _ensure_session_struct():
         st.session_state["bootstrap_done_for"] = set()
     if "offline" not in st.session_state:
         st.session_state["offline"] = False
+    # timestamp of when UI last finished processing (used for countdown)
+    if "ui_last_processed_ts" not in st.session_state:
+        st.session_state["ui_last_processed_ts"] = time.time()
 
 def persist_history_after_change():
-    """Save the st.session_state['oi_history'] to disk."""
     try:
-        # prune each key to HISTORICAL_MAX_MINUTES before saving
         now_utc = datetime.now(timezone.utc)
         pruned = {}
         for k, lst in st.session_state["oi_history"].items():
@@ -248,11 +238,6 @@ def persist_history_after_change():
         pass
 
 def update_live_oi_from_quote(kite: KiteConnect, details: dict):
-    """
-    Poll kite.quote for given option tradingsymbols.
-    Write canonical timestamp = now_utc for all quote entries for consistency.
-    Persist after update.
-    """
     _ensure_session_struct()
     now_utc = datetime.now(timezone.utc)
 
@@ -272,9 +257,8 @@ def update_live_oi_from_quote(kite: KiteConnect, details: dict):
     try:
         quotes = kite.quote(quoted_symbols)
         st.session_state["offline"] = False
-    except Exception as e:
-        # network / auth / rate limit failure => offline mode
-        st.session_state["online"] = True
+    except Exception:
+        st.session_state["offline"] = True
         return
 
     any_success = False
@@ -291,7 +275,6 @@ def update_live_oi_from_quote(kite: KiteConnect, details: dict):
 
         hist = st.session_state["oi_history"].setdefault(key, [])
         hist.append((now_utc, oi))
-        # prune
         cutoff = now_utc - timedelta(minutes=max(HISTORICAL_MAX_MINUTES, max(OI_CHANGE_INTERVALS_MIN)))
         st.session_state["oi_history"][key] = [t for t in hist if t[0] is not None and t[0] >= cutoff]
 
@@ -301,7 +284,6 @@ def update_live_oi_from_quote(kite: KiteConnect, details: dict):
     if any_success:
         st.session_state["last_quote_success"] = now_utc
     st.session_state["refresh_count"] += 1
-    # persist to disk
     persist_history_after_change()
 
 def fetch_last_oi_at_close(kite: KiteConnect, details: dict):
@@ -311,11 +293,10 @@ def fetch_last_oi_at_close(kite: KiteConnect, details: dict):
     from_utc = close_utc - timedelta(minutes=max(HISTORICAL_MAX_MINUTES, max(OI_CHANGE_INTERVALS_MIN)))
 
     try:
-        # test connectivity
         _ = kite.profile()
         st.session_state["offline"] = False
     except Exception:
-        st.session_state["online"] = True
+        st.session_state["offline"] = True
         return
 
     for key, d in details.items():
@@ -353,16 +334,11 @@ def fetch_last_oi_at_close(kite: KiteConnect, details: dict):
     persist_history_after_change()
 
 def bootstrap_history_from_historical_minutes(kite: KiteConnect, details: dict, minutes: int = BOOTSTRAP_MINUTES):
-    """
-    Fetch minute candles with oi=True for the last `minutes` and store them to session history.
-    Uses persistence so subsequent restarts keep this data.
-    """
     _ensure_session_struct()
     now_utc = datetime.now(timezone.utc)
     to_dt = now_utc
     from_dt = to_dt - timedelta(minutes=minutes)
 
-    # check connectivity
     try:
         _ = kite.profile()
         st.session_state["offline"] = False
@@ -373,10 +349,8 @@ def bootstrap_history_from_historical_minutes(kite: KiteConnect, details: dict, 
     for key, d in details.items():
         tok = d.get("instrument_token")
         if not tok:
-            # mark as attempted to avoid repeated failing calls
             st.session_state["bootstrap_done_for"].add(key)
             continue
-        # skip if already bootstraped this session
         if key in st.session_state["bootstrap_done_for"]:
             continue
         try:
@@ -405,18 +379,14 @@ def bootstrap_history_from_historical_minutes(kite: KiteConnect, details: dict, 
                     except Exception:
                         pass
                 hist_list.append((ct_utc, oi))
-            # merge into session history
             existing = st.session_state["oi_history"].get(key, [])
-            # combine and deduplicate by timestamp
             combined = existing + hist_list
-            # keep unique by timestamp, sorted
             combined_map = {}
             for t,o in combined:
                 if t is None:
                     continue
                 combined_map[t.isoformat()] = (t, o)
             combined_sorted = [combined_map[k] for k in sorted(combined_map.keys())]
-            # prune to HISTORICAL_MAX_MINUTES window
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=HISTORICAL_MAX_MINUTES)
             combined_sorted = [t for t in combined_sorted if t[0] >= cutoff]
             st.session_state["oi_history"][key] = combined_sorted
@@ -426,15 +396,9 @@ def bootstrap_history_from_historical_minutes(kite: KiteConnect, details: dict, 
         except Exception:
             st.session_state["bootstrap_done_for"].add(key)
             continue
-    # persist merged history
     persist_history_after_change()
 
 def compute_pct_changes_from_history(details: dict, intervals=(5,10,15,30)):
-    """
-    Return dict keyed by symbol key. For each interval m:
-      - pct_diff_{m}m : percentage or None
-      - pct_used_earliest_{m}m : True if earliest fallback was used
-    """
     _ensure_session_struct()
     out = {}
     now_utc = datetime.now(timezone.utc)
@@ -500,13 +464,186 @@ def build_table(report: dict, details: dict, atm: float, step: int, levels: int,
         rows.append(row)
     return pd.DataFrame(rows)
 
+# ---------- Background worker ----------
+_BG_LOCK = threading.Lock()
+_BG_STARTED_FLAG = "_oi_tracker_bg_started"
+
+def _background_worker_loop(default_underlying="NIFTY 50", default_levels=2, strike_diff_map=None, interval_sec=60):
+    if strike_diff_map is None:
+        strike_diff_map = {"NIFTY 50": 50, "NIFTY BANK": 100}
+
+    def merge_and_save(persist_path, new_data):
+        persisted = load_persisted_history(persist_path)
+        now_utc = datetime.now(timezone.utc)
+        for k, lst in new_data.items():
+            existing = persisted.get(k, [])
+            combined = existing + lst
+            cmap = {}
+            for t,o in combined:
+                if t is None:
+                    continue
+                cmap[t.isoformat()] = (t,o)
+            combined_sorted = [cmap[k] for k in sorted(cmap.keys())]
+            cutoff = now_utc - timedelta(minutes=HISTORICAL_MAX_MINUTES)
+            combined_sorted = [t for t in combined_sorted if t[0] >= cutoff]
+            persisted[k] = combined_sorted
+        save_persisted_history(persisted, persist_path)
+
+    while True:
+        try:
+            access_token = None
+            if os.path.exists("access_token.txt"):
+                try:
+                    with open("access_token.txt", "r") as f:
+                        access_token = f.read().strip()
+                except Exception:
+                    access_token = None
+
+            if not access_token:
+                time.sleep(interval_sec)
+                continue
+
+            kite = KiteConnect(api_key=API_KEY)
+            try:
+                kite.set_access_token(access_token)
+                _ = kite.profile()
+            except Exception:
+                time.sleep(interval_sec)
+                continue
+
+            try:
+                instruments = kite.instruments(EXCHANGE_NFO)
+            except Exception:
+                instruments = []
+
+            underlying = default_underlying
+            strike_diff = strike_diff_map.get(underlying, 50)
+            levels = default_levels
+
+            try:
+                atm, ltp = get_atm_strike(kite, underlying, EXCHANGE_LTP, strike_diff)
+            except Exception:
+                atm, ltp = None, None
+
+            if atm is None or not instruments:
+                time.sleep(interval_sec)
+                continue
+
+            expiries = list_expiries(instruments, underlying.split(" ")[0].upper())
+            if not expiries:
+                time.sleep(interval_sec)
+                continue
+            target_expiry = expiries[0]
+            symbol_prefix = symbol_prefix_for_expiry(instruments, underlying.split(" ")[0].upper(), target_expiry)
+
+            details = get_relevant_option_details(instruments, atm, target_expiry, strike_diff, levels, underlying.split(" ")[0].upper(), symbol_prefix)
+            if not details:
+                time.sleep(interval_sec)
+                continue
+
+            new_hist_data = {}
+            now_utc = datetime.now(timezone.utc)
+            from_dt = now_utc - timedelta(minutes=BOOTSTRAP_MINUTES)
+            to_dt = now_utc
+            for key, d in details.items():
+                tok = d.get("instrument_token")
+                if not tok:
+                    continue
+                try:
+                    candles = kite.historical_data(
+                        instrument_token=tok,
+                        from_date=from_dt,
+                        to_date=to_dt,
+                        interval="minute",
+                        oi=True,
+                        continuous=False
+                    )
+                except Exception:
+                    candles = None
+                hist_list = []
+                if candles:
+                    for c in candles:
+                        ct = c.get("date")
+                        oi = c.get("oi")
+                        if ct:
+                            ct_utc = ct.astimezone(timezone.utc)
+                        else:
+                            ct_utc = None
+                        if oi is not None:
+                            try:
+                                oi = int(oi)
+                            except Exception:
+                                pass
+                        hist_list.append((ct_utc, oi))
+                if hist_list:
+                    new_hist_data[key] = hist_list
+
+            if new_hist_data:
+                try:
+                    merge_and_save(HISTORY_FILE, new_hist_data)
+                except Exception:
+                    pass
+
+            quote_symbols = []
+            prefix = "NFO:"
+            sym_map = {}
+            for k,d in details.items():
+                ts = d.get("tradingsymbol")
+                if not ts:
+                    continue
+                qk = f"{prefix}{ts}"
+                quote_symbols.append(qk)
+                sym_map[qk] = k
+            try:
+                quotes = kite.quote(quote_symbols)
+            except Exception:
+                quotes = {}
+
+            now_utc = datetime.now(timezone.utc)
+            new_quote_hist = {}
+            for qk, key in sym_map.items():
+                entry = quotes.get(qk) or quotes.get(qk.replace("NFO:", "")) or {}
+                oi = None
+                if isinstance(entry, dict):
+                    oi = entry.get("oi")
+                if oi is not None:
+                    try:
+                        oi = int(oi)
+                    except Exception:
+                        pass
+                new_quote_hist.setdefault(key, []).append((now_utc, oi))
+
+            if new_quote_hist:
+                try:
+                    merge_and_save(HISTORY_FILE, new_quote_hist)
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        time.sleep(interval_sec)
+
+def start_background_worker_if_needed(interval_sec=60, default_underlying="NIFTY 50", default_levels=2):
+    with _BG_LOCK:
+        if st.session_state.get(_BG_STARTED_FLAG):
+            return
+        t = threading.Thread(
+            target=_background_worker_loop,
+            kwargs={"default_underlying": default_underlying, "default_levels": default_levels, "interval_sec": interval_sec},
+            daemon=True,
+            name="oi-tracker-bg"
+        )
+        t.start()
+        st.session_state[_BG_STARTED_FLAG] = True
+
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="OI Tracker (Live OI via quote + persistence)", layout="wide")
+st.set_page_config(page_title="OI Tracker (Soft Auto-refresh + Alerts)", layout="wide")
 
 if not check_password():
     st.stop()
 
-st.title("📊 OI Tracker — Live OI + local persistence (shows lookbacks after restart/offline)")
+st.title("📊 OI Tracker — Live OI + local persistence (soft auto-refresh + alerts)")
 
 kite = KiteConnect(api_key=API_KEY)
 
@@ -536,33 +673,41 @@ with st.sidebar:
     underlying = st.selectbox("Underlying", ("NIFTY 50", "NIFTY BANK"), index=0)
     strike_diff = 50 if underlying == "NIFTY 50" else 100
     levels = st.slider("Strikes each side of ATM", 1, 6, 2)
-    refresh = st.number_input("Refresh seconds", min_value=5, max_value=300, value=30, step=5)
-    autorun = st.checkbox("Auto-refresh", value=True)
+
+    # Soft UI refresh control
+    refresh = st.number_input("Refresh seconds (UI soft refresh)", min_value=5, max_value=600, value=30, step=1)
+    autorun = st.checkbox("Auto-refresh (UI soft rerun)", value=True)
     go = st.button("Run / Refresh")
+
+    st.markdown("---")
+    st.subheader("Background fetch (server-side)")
+    bg_interval = st.number_input("Background interval (seconds)", min_value=15, max_value=3600, value=60, step=15)
+    bg_enable = st.checkbox("Enable background fetch thread (keeps HISTORY_FILE updated)", value=True)
+    st.caption("Background worker requires access_token.txt in the app folder (or generate above). It runs as long as the Streamlit process is alive on the server.")
 
 market_closed = is_market_closed_now()
 
-# Auto-refresh
-# Auto-refresh (soft)
+# Auto-refresh (soft) for UI only
 if autorun and not market_closed:
-    try:
-        from streamlit_autorefresh import st_autorefresh
+    if HAVE_STREAMLIT_AUTOREFRESH:
         st_autorefresh(interval=refresh * 1000, key="oi_soft_refresh")
         st.caption(f"🔄 Soft auto-refresh ON — every {refresh} seconds")
-    except ImportError:
-        # fallback if streamlit-autorefresh not installed
+    else:
         last = st.session_state.get("last_refresh", 0.0)
-        now = time.time()
-        if now - last > refresh:
-            st.session_state["last_refresh"] = now
+        now_ts = time.time()
+        if now_ts - last > refresh:
+            st.session_state["last_refresh"] = now_ts
             try:
                 st.experimental_rerun()
             except Exception:
                 pass
 
-
-# ensure session history loaded
+# ensure session history loaded and ui timestamp exists
 _ensure_session_struct()
+
+# start background worker if requested
+if bg_enable:
+    start_background_worker_if_needed(interval_sec=int(bg_interval), default_underlying=underlying, default_levels=levels)
 
 if "access_token" not in st.session_state:
     st.info("Generate Access Token in the sidebar to begin.")
@@ -571,7 +716,6 @@ if "access_token" not in st.session_state:
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(st.session_state["access_token"])
 
-# Check login; if fails we go to offline mode but still show persisted data
 try:
     prof = kite.profile()
     st.success(f"Connected: {prof.get('user_id')} — {prof.get('user_name')}")
@@ -580,7 +724,6 @@ except Exception:
     st.warning("Could not verify Kite login — working in OFFLINE mode using persisted history if available.")
     st.session_state["offline"] = True
 
-# Load instruments (cached)
 @st.cache_data(ttl=600)
 def load_instruments(nfo_exchange: str):
     return kite.instruments(nfo_exchange)
@@ -601,6 +744,14 @@ exp_strs = [ex.strftime("%d-%b-%Y (%a)") for ex in expiries]
 sel_idx = st.sidebar.selectbox("Target Expiry", range(len(expiries)), format_func=lambda i: exp_strs[i], index=0)
 target_expiry = expiries[sel_idx]
 symbol_prefix = symbol_prefix_for_expiry(instruments, under_prefix, target_expiry)
+
+# ---------- UI countdown (approx) ----------
+# compute seconds since last UI processing finish and show time-left until next soft refresh
+now_ts = time.time()
+last_proc = st.session_state.get("ui_last_processed_ts", now_ts)
+elapsed_since_last_proc = now_ts - last_proc
+time_left = max(0, int(refresh - elapsed_since_last_proc))
+st.metric("Next soft refresh (approx sec)", f"{time_left}s")
 
 if go or autorun or market_closed:
     atm, ltp = get_atm_strike(kite, underlying, EXCHANGE_LTP, strike_diff)
@@ -631,7 +782,6 @@ if go or autorun or market_closed:
         st.warning("No matching option contracts found around ATM for selected expiry.")
         st.stop()
 
-    # Bootstrapping: if market open & not offline, ensure we have history to cover lookbacks
     if not market_closed and not st.session_state.get("offline"):
         need_bootstrap = False
         now_utc = datetime.now(timezone.utc)
@@ -647,11 +797,9 @@ if go or autorun or market_closed:
         if need_bootstrap:
             bootstrap_history_from_historical_minutes(kite, details, minutes=BOOTSTRAP_MINUTES)
 
-    # Update live quotes (if possible)
     if not market_closed and not st.session_state.get("offline"):
         update_live_oi_from_quote(kite, details)
     else:
-        # After close or offline: ensure we have a last-close value if no persisted/bootstrapped history
         need_fetch = False
         for key in details.keys():
             if not st.session_state["oi_history"].get(key):
@@ -660,11 +808,34 @@ if go or autorun or market_closed:
         if need_fetch and not st.session_state.get("offline"):
             fetch_last_oi_at_close(kite, details)
 
-    # If offline and we have persisted history, we'll compute using that.
     report = compute_pct_changes_from_history(details, intervals=OI_CHANGE_INTERVALS_MIN)
 
     calls_df = build_table(report, details, atm, strike_diff, levels, is_call=True)
     puts_df  = build_table(report, details, atm, strike_diff, levels, is_call=False)
+
+    # ---------- Visual alerts styling ----------
+    # create a styler that highlights OI %Chg columns that breach thresholds
+    def style_breaches(df):
+        df_sty = df.style
+        # highlight cells per-value
+        def highlight_cell(val, thr):
+            try:
+                if val is None:
+                    return ""
+                v = float(val)
+            except Exception:
+                return ""
+            if abs(v) >= thr:
+                return "background-color: #ffcccc; color: #700000; font-weight:700"  # red-ish
+            if abs(v) >= 0.8 * thr:
+                return "background-color: #fff5cc; color: #7a5200"  # yellow-ish
+            return ""
+        for m in OI_CHANGE_INTERVALS_MIN:
+            col = f"OI %Chg ({m}m)"
+            if col in df.columns:
+                thr = PCT_CHANGE_THRESHOLDS.get(m, 10.0)
+                df_sty = df_sty.applymap(lambda v, thr=thr: highlight_cell(v, thr), subset=pd.IndexSlice[:, [col]])
+        return df_sty
 
     fmt_cols = {"Latest OI": lambda v: safe_fmt(v, "{:,.0f}") if v not in (None, "") else ""}
     for m in OI_CHANGE_INTERVALS_MIN:
@@ -672,10 +843,17 @@ if go or autorun or market_closed:
         fmt_cols[col] = (lambda f: (lambda v: safe_fmt(v, f)))("{:+.2f}%")
 
     st.markdown("### Calls (ΔOI %)")
-    st.dataframe(calls_df.style.format(fmt_cols))
+    try:
+        st.dataframe(style_breaches(calls_df).format(fmt_cols), use_container_width=True)
+    except Exception:
+        # fallback if styling fails
+        st.dataframe(calls_df.style.format(fmt_cols), use_container_width=True)
 
     st.markdown("### Puts (ΔOI %)")
-    st.dataframe(puts_df.style.format(fmt_cols))
+    try:
+        st.dataframe(style_breaches(puts_df).format(fmt_cols), use_container_width=True)
+    except Exception:
+        st.dataframe(puts_df.style.format(fmt_cols), use_container_width=True)
 
     # Debug + persistence info
     st.markdown("### Debug: history preview (symbol → last_ts IST, last_oi, history_len, recent entries, bootstrapped?, persisted?)")
@@ -707,7 +885,16 @@ if go or autorun or market_closed:
 
     bc, bt = breach_count(calls_df)
     pc, pt = breach_count(puts_df)
-    st.info(f"Threshold breaches — Calls: {bc}/{bt}, Puts: {pc}/{pt}")
+    # show a compact alert summary
+    if bc + pc > 0:
+        st.warning(f"Threshold breaches — Calls: {bc}/{bt}, Puts: {pc}/{pt}")
+    else:
+        st.success(f"No %OI threshold breaches — Calls: {bc}/{bt}, Puts: {pc}/{pt}")
+
+    # record UI processed time to power countdown next run
+    st.session_state["ui_last_processed_ts"] = time.time()
 
 else:
     st.info("Select a **Target Expiry** and click **Run / Refresh**.")
+
+st.succsess("bye")
