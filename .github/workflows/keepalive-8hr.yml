@@ -1,9 +1,8 @@
-name: Streamlit keep-alive (every 8 hours)
+name: Keep Streamlit App Awake (using PAT)
 
-# Runs every 8 hours (UTC)
 on:
   schedule:
-    - cron: "0 */8 * * *"   # at 00:00, 08:00, 16:00 UTC
+    - cron: "0 */8 * * *"   # every 8 hours UTC
   workflow_dispatch: {}
 
 jobs:
@@ -13,12 +12,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
+          persist-credentials: false   # we'll auth with PAT instead
 
-      - name: Configure git
+      - name: Configure git with PAT
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # git identity
+          git config user.name "keepalive-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          # rewrite origin URL with PAT
+          ORIGIN_URL=$(git config --get remote.origin.url || true)
+          echo "Original origin: $ORIGIN_URL"
+          if [[ "$ORIGIN_URL" == https://* ]]; then
+            AUTH_URL=$(echo "$ORIGIN_URL" | sed -E "s#https://#https://x-access-token:${PAT}@#")
+            git remote set-url origin "$AUTH_URL"
+            echo "Remote URL updated to use PAT."
+          else
+            echo "Skipping remote URL rewrite."
+          fi
 
       - name: Update keep-alive file
         id: update_file
@@ -26,20 +39,22 @@ jobs:
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           echo "Last keep-alive (UTC): $TIMESTAMP" > .streamlit-keepalive.txt
           git add .streamlit-keepalive.txt || true
+
           if git diff --staged --quiet; then
-            echo "no-changes"
-            echo "::set-output name=changed::false"
+            echo "No changes to commit."
+            echo "changed=false" >> $GITHUB_OUTPUT
           else
             git commit -m "chore(keep-alive): heartbeat $TIMESTAMP"
-            echo "::set-output name=changed::true"
+            echo "Committed keep-alive update."
+            echo "changed=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Push commit if changed
         if: steps.update_file.outputs.changed == 'true'
         run: |
-          git push origin HEAD
+          git push origin HEAD || echo "Push failed (maybe no changes)"
 
-      - name: Ping Streamlit app (up to 3 tries)
+      - name: Ping Streamlit app
         run: |
           APP_URL="https://Rudraj-traders.streamlit.app"
           echo "Pinging $APP_URL ..."
