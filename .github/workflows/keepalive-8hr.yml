@@ -1,0 +1,53 @@
+name: Streamlit keep-alive (every 8 hours)
+
+# Runs every 8 hours (UTC)
+on:
+  schedule:
+    - cron: "0 */8 * * *"   # at 00:00, 08:00, 16:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  keep-awake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update keep-alive file
+        id: update_file
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Last keep-alive (UTC): $TIMESTAMP" > .streamlit-keepalive.txt
+          git add .streamlit-keepalive.txt || true
+          if git diff --staged --quiet; then
+            echo "no-changes"
+            echo "::set-output name=changed::false"
+          else
+            git commit -m "chore(keep-alive): heartbeat $TIMESTAMP"
+            echo "::set-output name=changed::true"
+          fi
+
+      - name: Push commit if changed
+        if: steps.update_file.outputs.changed == 'true'
+        run: |
+          git push origin HEAD
+
+      - name: Ping Streamlit app (up to 3 tries)
+        run: |
+          APP_URL="https://Rudraj-traders.streamlit.app"
+          echo "Pinging $APP_URL ..."
+          for i in 1 2 3; do
+            HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" --max-time 30 "$APP_URL" || echo "000")
+            echo "Attempt $i - HTTP status: $HTTP_STATUS"
+            if [ "$HTTP_STATUS" != "000" ]; then
+              break
+            fi
+            sleep 5
+          done
